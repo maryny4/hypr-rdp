@@ -40,6 +40,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         egfx_codec,
         keyboard_layout_policy,
         audio_mode,
+        encoder,
         resolution_fixed,
         output,
         on_client_connect,
@@ -47,6 +48,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     } = config;
 
     let addr = parse_bind_addr(&bind)?;
+    crate::egfx::set_encoder_policy(encoder);
 
     let egfx_shared = Arc::new(EgfxShared::with_codec_policy(
         max_frames_in_flight,
