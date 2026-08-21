@@ -19,10 +19,15 @@ use crate::input::{HyprInputHandler, RdpInputSessionSink, SharedOutputLayout};
 mod session_hooks;
 mod tls;
 
-use session_hooks::{session_hooks_from_config, SessionHooks};
+use session_hooks::{session_hooks_from_config, SharedSessionHooks};
 
 pub struct ServerContext {
     server: RdpServer,
+    addr: SocketAddr,
+    session_hooks: Option<SharedSessionHooks>,
+    /// Shared with the connection handler: the accept loop below owns the
+    /// session-end boundary, and releasing held keys is part of it.
+    input_session_sink: Arc<dyn RdpInputSessionSink>,
     pub display_handle: HyprDisplayHandle,
 }
 
@@ -81,7 +86,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let input_session_sink = input_handler
         .rdp_input_session_handle()
         .context("input handler has no command channel")?;
-    let input_session_sink: Box<dyn RdpInputSessionSink> = Box::new(input_session_sink);
+    let input_session_sink: Arc<dyn RdpInputSessionSink> = Arc::new(input_session_sink);
 
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
@@ -109,8 +114,8 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
-            input_session_sink,
-            session_hooks,
+            Arc::clone(&input_session_sink),
+            session_hooks.clone(),
         ))))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
@@ -123,6 +128,9 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
 
     Ok(ServerContext {
         server,
+        addr: bind,
+        session_hooks,
+        input_session_sink,
         display_handle,
     })
 }
@@ -137,23 +145,121 @@ fn sound_factory_for_audio_mode(audio_mode: AudioMode) -> Option<Box<dyn SoundSe
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
-    ctx.server.run().await.map_err(server_run_error)
+    let listener = bind_listener(ctx.addr)?;
+    tracing::info!("Listening for RDP connections on {}", ctx.addr);
+    serve_on(
+        listener,
+        &mut ctx.server,
+        ctx.session_hooks.as_ref(),
+        ctx.input_session_sink.as_ref(),
+    )
+    .await
 }
 
 fn server_run_error(error: ServerError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
 
+/// Accept connections and serve one session at a time, closing any extra
+/// connection immediately instead of leaving it to hang in the backlog.
+///
+/// `RdpServer::run()` accepts serially, so while a session runs a second
+/// client sits unanswered until the first ends and appears to hang (issue #8).
+async fn serve_on(
+    listener: tokio::net::TcpListener,
+    server: &mut RdpServer,
+    session_hooks: Option<&SharedSessionHooks>,
+    input_session_sink: &dyn RdpInputSessionSink,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = match accept_session(&listener).await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!("Accept failed: {:#}", error);
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        tracing::info!(%peer, "RDP connection accepted");
+
+        let mut session = std::pin::pin!(server.run_connection(stream));
+        let result = loop {
+            tokio::select! {
+                // Session first, so a client reconnecting the instant a session
+                // ends is served by the outer loop rather than bounced here.
+                biased;
+                result = &mut session => break result,
+                extra = listener.accept() => match extra {
+                    Ok((extra_stream, extra_peer)) => {
+                        tracing::debug!(peer = %extra_peer, "Session active; rejecting connection");
+                        drop(extra_stream);
+                    }
+                    Err(err) => {
+                        // A resource limit leaves the socket queued and the
+                        // listener readable, so retrying at once would spin.
+                        tracing::warn!("Accept failed while a session is active: {}", err);
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    }
+                },
+            }
+        };
+        // This loop stands in for `RdpServer::run`, the only caller of
+        // `on_disconnected`, so the session-end boundary is ours: release the
+        // keys the session held and run the end hook. Both are no-ops for a
+        // connection that never established a session. (IronRDP releases the
+        // session's static channels itself on the way out of
+        // `run_connection_with`, so that boundary needs nothing here.)
+        input_session_sink.session_ended();
+        if let Some(hooks) = session_hooks {
+            hooks.session_ended();
+        }
+        if let Err(err) = result {
+            tracing::error!("Connection error: {:#}", server_run_error(err));
+        }
+    }
+}
+
+/// Pause after an accept failure (EMFILE/ENFILE/ENOBUFS keep the listener
+/// readable, so an immediate retry would busy-loop).
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Accept one connection and set the socket options `RdpServer::run` would
+/// have set. RDP output is small writes the peer waits on, so Nagle off.
+async fn accept_session(
+    listener: &tokio::net::TcpListener,
+) -> Result<(tokio::net::TcpStream, SocketAddr)> {
+    let (stream, peer) = listener.accept().await.context("accept failed")?;
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!(%peer, "Failed to set TCP_NODELAY: {}", err);
+    }
+    Ok((stream, peer))
+}
+
+fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4().context("create IPv4 socket")?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6().context("create IPv6 socket")?,
+    };
+    // SO_REUSEADDR matches RdpServer::run(): restarts must not trip over a
+    // socket still in TIME_WAIT.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true).context("set SO_REUSEADDR")?;
+    socket.bind(addr).context("bind listen address")?;
+    // Match RdpServer::run's LISTENER_BACKLOG so a burst of reconnects is not
+    // dropped by the kernel before the loop can reject them.
+    socket.listen(1024).context("start listener")
+}
+
 /// Adapts IronRDP connection boundaries to application-owned policies.
 struct ClientConnectionHandler {
-    input_session_sink: Box<dyn RdpInputSessionSink>,
-    session_hooks: Option<SessionHooks>,
+    input_session_sink: Arc<dyn RdpInputSessionSink>,
+    session_hooks: Option<SharedSessionHooks>,
 }
 
 impl ClientConnectionHandler {
     fn new(
-        input_session_sink: Box<dyn RdpInputSessionSink>,
-        session_hooks: Option<SessionHooks>,
+        input_session_sink: Arc<dyn RdpInputSessionSink>,
+        session_hooks: Option<SharedSessionHooks>,
     ) -> Self {
         Self {
             input_session_sink,
@@ -166,14 +272,14 @@ impl ConnectionHandler for ClientConnectionHandler {
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
         self.input_session_sink
             .set_keyboard_layout(info.keyboard_layout);
-        if let Some(hooks) = &mut self.session_hooks {
+        if let Some(hooks) = &self.session_hooks {
             hooks.session_started();
         }
     }
 
-    /// The server calls this only from its own accept loop, so anything that
-    /// takes ownership of the loop and drives `run_connection` directly has to
-    /// invoke the session-end path itself.
+    /// Kept as a safety net: `serve_on` owns the accept loop this would be
+    /// called from, and reports the boundary itself. `session_ended` is
+    /// idempotent, so reaching both paths would still run one end command.
     fn on_disconnected(
         &mut self,
         _peer: SocketAddr,
@@ -181,7 +287,7 @@ impl ConnectionHandler for ClientConnectionHandler {
         _error: Option<&ServerError>,
     ) -> PostConnectionAction {
         self.input_session_sink.session_ended();
-        if let Some(hooks) = &mut self.session_hooks {
+        if let Some(hooks) = &self.session_hooks {
             hooks.session_ended();
         }
         PostConnectionAction::Continue
@@ -213,7 +319,7 @@ fn security_mode_for_credentials(credentials: &Option<Credentials>) -> ServerSec
 #[cfg(test)]
 mod tests {
     use super::session_hooks::test_support::{
-        echo_start, hook_log_path, test_hooks, wait_for_log, LOG_CEILING,
+        echo_start, hook_log_path, shared_test_hooks, wait_for_log, LOG_CEILING,
     };
     use super::*;
 
@@ -221,6 +327,7 @@ mod tests {
     use ironrdp_server::{
         ConnectionHandler, ConnectionInfo, PostConnectionAction, RdpServer, ServerEvent,
     };
+    use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -263,8 +370,8 @@ mod tests {
         }
 
         let log = hook_log_path("forwarding");
-        let hooks = test_hooks(&log, echo_start(&log, ""), true);
-        let mut handler = ClientConnectionHandler::new(Box::new(NoopSink), Some(hooks));
+        let hooks = shared_test_hooks(&log, echo_start(&log, ""), true);
+        let mut handler = ClientConnectionHandler::new(Arc::new(NoopSink), Some(hooks));
 
         handler.on_connection_info(&test_connection_info());
         assert_eq!(wait_for_log(&log, "start\n", LOG_CEILING), "start\n");
@@ -296,7 +403,7 @@ mod tests {
 
         let released = Arc::new(Mutex::new(false));
         let mut handler = ClientConnectionHandler::new(
-            Box::new(ReleaseRecordingSink {
+            Arc::new(ReleaseRecordingSink {
                 released: Arc::clone(&released),
             }),
             None,
@@ -326,7 +433,7 @@ mod tests {
         let sink = RecordingSink {
             layouts: Arc::clone(&layouts),
         };
-        let mut handler = ClientConnectionHandler::new(Box::new(sink), None);
+        let mut handler = ClientConnectionHandler::new(Arc::new(sink), None);
 
         handler.on_connection_info(&ConnectionInfo::new(
             0x00000407,
@@ -368,6 +475,227 @@ mod tests {
         assert!(sound_factory_for_audio_mode(AudioMode::Off).is_none());
     }
 
+    /// Counts session ends, so a test can tell whether the accept loop
+    /// reported the boundary the connection handler would have.
+    struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl RdpInputSessionSink for CountingSink {
+        fn set_keyboard_layout(&self, _keyboard_layout: u32) {}
+        fn session_ended(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_on_reports_session_end_to_sink_and_hooks() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let log = hook_log_path("accept-loop-end");
+        let hooks = shared_test_hooks(&log, echo_start(&log, ""), true);
+        // The start boundary belongs to the connection handler; this test
+        // covers the end boundary, which `RdpServer::run` would report and
+        // `serve_on` therefore has to report itself.
+        hooks.session_started();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        // `on_disconnected` is only called from `RdpServer::run`'s own accept
+        // loop, which this replaces, so releasing the keys the session left
+        // held is this loop's job too. Missing it leaves a modifier stuck in
+        // the compositor after every disconnect.
+        let releases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = CountingSink(std::sync::Arc::clone(&releases));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let loop_hooks = hooks.clone();
+                tokio::task::spawn_local(async move {
+                    let _ = serve_on(listener, &mut server, Some(&loop_hooks), &sink).await;
+                });
+
+                // A client that connects and leaves: the session it stood for
+                // has to reach the end hook.
+                let client = TcpStream::connect(addr).await.expect("connect");
+                drop(client);
+
+                // Async wait: a blocking one would stop the accept loop task
+                // from ever running on this single-threaded LocalSet.
+                let deadline = std::time::Instant::now() + LOG_CEILING;
+                let content = loop {
+                    let content = std::fs::read_to_string(&log).unwrap_or_default();
+                    if content == "start\nend\n" || std::time::Instant::now() > deadline {
+                        break content;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+
+                assert_eq!(
+                    content, "start\nend\n",
+                    "a session that ends under our own accept loop must still run the end hook"
+                );
+                assert_eq!(
+                    releases.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "the accept loop must also release the keys the session held"
+                );
+                std::fs::remove_file(&log).expect("remove hook log");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn accepted_session_socket_has_nagle_disabled() {
+        // `RdpServer::run` sets this on every socket it accepts; the accept
+        // loop that replaces it has to do the same, or every small write waits
+        // on the previous one's acknowledgement.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (stream, _peer) = accept_session(&listener).await.expect("accept");
+
+        assert!(
+            stream.nodelay().expect("read TCP_NODELAY"),
+            "Nagle still enabled on the accepted session socket"
+        );
+        drop(client.await.expect("client task").expect("client connect"));
+    }
+
+    #[tokio::test]
+    async fn serve_on_rejects_second_client_while_session_active_and_serves_next() {
+        // The failure being fixed is a connection nobody answers, and a read
+        // that times out cannot tell "the server is waiting for my handshake"
+        // from "the server stopped accepting". The positive proof that the
+        // loop took the next client is that it bounces the one behind it: a
+        // loop that stopped accepting bounces nobody.
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let sink =
+                    CountingSink(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+                tokio::task::spawn_local(async move {
+                    let _ = serve_on(listener, &mut server, None, &sink).await;
+                });
+
+                let mut buf = [0u8; 8];
+
+                // Occupy the session, and wait for a bounce to confirm the
+                // loop really is inside one before ending it.
+                let holder = TcpStream::connect(addr).await.expect("first connect");
+                let mut probe = TcpStream::connect(addr).await.expect("probe connect");
+                let read = tokio::time::timeout(Duration::from_secs(5), probe.read(&mut buf))
+                    .await
+                    .expect("the busy arm must answer")
+                    .expect("read on the bounced connection");
+                assert_eq!(read, 0, "busy server must close the extra connection");
+                drop(holder);
+
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let successor = TcpStream::connect(addr).await.expect("successor connect");
+                    let mut follower = TcpStream::connect(addr).await.expect("follower connect");
+                    let bounced =
+                        tokio::time::timeout(Duration::from_secs(1), follower.read(&mut buf)).await;
+                    if matches!(bounced, Ok(Ok(0))) {
+                        // The successor is the session, so the follower was
+                        // bounced by the busy arm: the loop is serving again.
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the accept loop never took another client after its session ended"
+                    );
+                    drop(successor);
+                    drop(follower);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn serve_on_recovers_from_a_malformed_pre_auth_client() {
+        // A client that sends garbage and leaves (43 zero bytes, no valid
+        // X.224) must not wedge the loop: run_connection returns an error and
+        // the next client is served. This is the maintainer's #79 case on the
+        // accept loop that now owns the path.
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let sink =
+                    CountingSink(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+                tokio::task::spawn_local(async move {
+                    let _ = serve_on(listener, &mut server, None, &sink).await;
+                });
+
+                let mut buf = [0u8; 8];
+
+                // Garbage, then gone.
+                let mut malformed = TcpStream::connect(addr).await.expect("malformed connect");
+                malformed
+                    .write_all(&[0u8; 43])
+                    .await
+                    .expect("write malformed bytes");
+                drop(malformed);
+
+                // The loop must serve again. Proof, as in the reject test: the
+                // successor is the session because the follower behind it is
+                // bounced. A wedged loop bounces nobody.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let successor = TcpStream::connect(addr).await.expect("successor connect");
+                    let mut follower = TcpStream::connect(addr).await.expect("follower connect");
+                    let bounced =
+                        tokio::time::timeout(Duration::from_secs(1), follower.read(&mut buf)).await;
+                    if matches!(bounced, Ok(Ok(0))) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a malformed pre-auth client wedged the accept loop"
+                    );
+                    drop(successor);
+                    drop(follower);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+    }
     #[tokio::test]
     async fn server_lifecycle_quit_exits_after_ephemeral_bind() {
         let mut server = RdpServer::builder()
