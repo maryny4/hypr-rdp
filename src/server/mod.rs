@@ -660,6 +660,33 @@ mod tests {
         assert_eq!(rc, 0, "getsockopt SO_KEEPALIVE failed");
         assert_ne!(ka, 0, "SO_KEEPALIVE not enabled");
 
+        // The keepalive cadence is what actually makes an idle-but-dead peer
+        // produce probes for TCP_USER_TIMEOUT to bound; verify each knob, not
+        // just that keepalive is on.
+        let read_int = |opt: libc::c_int| -> libc::c_int {
+            let mut v: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: fd is a live socket owned by `stream`; v/len outlive the call.
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    opt,
+                    std::ptr::addr_of_mut!(v).cast::<libc::c_void>(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt failed");
+            v
+        };
+        assert_eq!(
+            read_int(libc::TCP_KEEPIDLE),
+            (SESSION_LIVENESS_TIMEOUT_SECS / 2) as libc::c_int,
+            "TCP_KEEPIDLE not set to half the liveness bound"
+        );
+        assert_eq!(read_int(libc::TCP_KEEPINTVL), 5, "TCP_KEEPINTVL not 5s");
+        assert_eq!(read_int(libc::TCP_KEEPCNT), 3, "TCP_KEEPCNT not 3");
+
         drop(client.await.expect("client task").expect("client connect"));
     }
 
@@ -685,8 +712,8 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
-                let sink =
-                    CountingSink(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+                let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let sink = CountingSink(std::sync::Arc::clone(&ended));
                 tokio::task::spawn_local(async move {
                     let _ = serve_on(listener, &mut server, None, &sink).await;
                 });
@@ -703,6 +730,20 @@ mod tests {
                     .expect("read on the bounced connection");
                 assert_eq!(read, 0, "busy server must close the extra connection");
                 drop(holder);
+
+                // The holder was the session; the loop must reach the end
+                // boundary for it (session_ended fires) before it can serve
+                // anyone else. A loop still wedged inside the holder never
+                // increments this, so it distinguishes "drained, moving on"
+                // from "still stuck" -- which a bounce alone cannot.
+                let drained_by = std::time::Instant::now() + Duration::from_secs(10);
+                while ended.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                    assert!(
+                        std::time::Instant::now() < drained_by,
+                        "the accept loop never left the first session"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
 
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
@@ -748,8 +789,8 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
-                let sink =
-                    CountingSink(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+                let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let sink = CountingSink(std::sync::Arc::clone(&ended));
                 tokio::task::spawn_local(async move {
                     let _ = serve_on(listener, &mut server, None, &sink).await;
                 });
@@ -764,9 +805,22 @@ mod tests {
                     .expect("write malformed bytes");
                 drop(malformed);
 
-                // The loop must serve again. Proof, as in the reject test: the
-                // successor is the session because the follower behind it is
-                // bounced. A wedged loop bounces nobody.
+                // The malformed client held the session slot; the loop must
+                // reach its end boundary (session_ended) and move on. A loop
+                // that wedged on the garbage instead never increments this --
+                // this is the #79 failure the bounce proof below cannot see on
+                // its own, since a stuck-but-alive loop bounces a follower too.
+                let drained_by = std::time::Instant::now() + Duration::from_secs(10);
+                while ended.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                    assert!(
+                        std::time::Instant::now() < drained_by,
+                        "a malformed pre-auth client wedged the accept loop"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+
+                // And it must serve again: the successor is the session because
+                // the follower behind it is bounced.
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
                     let successor = TcpStream::connect(addr).await.expect("successor connect");
