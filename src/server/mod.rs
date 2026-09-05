@@ -232,7 +232,46 @@ async fn accept_session(
     if let Err(err) = stream.set_nodelay(true) {
         tracing::warn!(%peer, "Failed to set TCP_NODELAY: {}", err);
     }
+    if !set_session_liveness_timeout(&stream) {
+        tracing::warn!(%peer, "Failed to set session liveness timeout");
+    }
     Ok((stream, peer))
+}
+
+/// How long a dead peer may hold the single session slot before the kernel
+/// drops it. Without this a peer that stops responding keeps the slot for
+/// `tcp_retries2` (~13-30 min), so a reconnect is refused that whole time.
+const SESSION_LIVENESS_TIMEOUT_SECS: u32 = 30;
+
+/// Bound the dead-peer hold. `TCP_USER_TIMEOUT` caps retransmission of
+/// unacknowledged data; `SO_KEEPALIVE` (with the interval knobs) makes an
+/// idle-but-dead peer produce probes so the timeout bites even when the server
+/// is only waiting to read. The trade-off: a live session across a network
+/// stall longer than the bound is torn down and the client must reconnect
+/// (mstsc does so with its auto-reconnect cookie). Returns false if any option
+/// did not take.
+fn set_session_liveness_timeout(stream: &tokio::net::TcpStream) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    let set = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| -> bool {
+        // SAFETY: `fd` is a live socket owned by `stream` for the call, and
+        // `val` outlives the pointer passed to `setsockopt`.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                std::ptr::addr_of!(val).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) == 0
+        }
+    };
+    let secs = SESSION_LIVENESS_TIMEOUT_SECS as libc::c_int;
+    set(libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, secs * 1000)
+        && set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)
+        && set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, secs / 2)
+        && set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5)
+        && set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3)
 }
 
 fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
@@ -569,6 +608,58 @@ mod tests {
             stream.nodelay().expect("read TCP_NODELAY"),
             "Nagle still enabled on the accepted session socket"
         );
+        drop(client.await.expect("client task").expect("client connect"));
+    }
+
+    #[tokio::test]
+    async fn accepted_session_socket_has_a_liveness_timeout() {
+        // A dead peer must not hold the single slot for tcp_retries2. We can
+        // only assert the options were set here -- a real teardown needs a
+        // black-hole peer, which loopback cannot produce.
+        use std::os::fd::AsRawFd as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (stream, _peer) = accept_session(&listener).await.expect("accept");
+
+        let fd = stream.as_raw_fd();
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: fd is a live socket owned by `stream`; val/len outlive the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                std::ptr::addr_of_mut!(val).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt TCP_USER_TIMEOUT failed");
+        assert_eq!(
+            val,
+            (SESSION_LIVENESS_TIMEOUT_SECS * 1000) as libc::c_int,
+            "TCP_USER_TIMEOUT not set to the liveness bound"
+        );
+
+        let mut ka: libc::c_int = 0;
+        let mut kalen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of_mut!(ka).cast::<libc::c_void>(),
+                &mut kalen,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt SO_KEEPALIVE failed");
+        assert_ne!(ka, 0, "SO_KEEPALIVE not enabled");
+
         drop(client.await.expect("client task").expect("client connect"));
     }
 
